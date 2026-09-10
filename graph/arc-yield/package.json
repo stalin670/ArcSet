@@ -1,0 +1,16 @@
+{
+  "name": "arc-set-yield-subgraph",
+  "version": "0.3.0",
+  "private": true,
+  "scripts": {
+    "codegen": "graph codegen subgraph.yaml",
+    "build": "graph build subgraph.yaml",
+    "deploy:studio": "graph deploy arc-vaults subgraph.yaml"
+  },
+  "dependencies": {
+    "@graphprotocol/graph-ts": "^0.38.2"
+  },
+  "devDependencies": {
+    "@graphprotocol/graph-cli": "^0.98.1"
+  }
+}

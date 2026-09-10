@@ -1,0 +1,183 @@
+"""Messari Yield Aggregator schema v1.3.1 core, extended with ARC_TESTNET."""
+enum Network { ARC_TESTNET }
+enum ProtocolType { YIELD }
+enum VaultEligibility { ELIGIBLE EXPERIMENTAL REJECTED }
+
+type Token @entity(immutable: false) {
+  id: ID!
+  name: String!
+  symbol: String!
+  decimals: Int!
+  lastPriceUSD: BigDecimal
+  lastPriceBlockNumber: BigInt
+}
+
+type YieldAggregator @entity(immutable: false) {
+  id: ID!
+  name: String!
+  slug: String!
+  schemaVersion: String!
+  subgraphVersion: String!
+  methodologyVersion: String!
+  network: Network!
+  type: ProtocolType!
+  totalValueLockedUSD: BigDecimal!
+  protocolControlledValueUSD: BigDecimal
+  cumulativeSupplySideRevenueUSD: BigDecimal!
+  cumulativeProtocolSideRevenueUSD: BigDecimal!
+  cumulativeTotalRevenueUSD: BigDecimal!
+  cumulativeUniqueUsers: Int!
+  totalPoolCount: Int!
+  dailyUsageMetrics: [UsageMetricsDailySnapshot!]! @derivedFrom(field: "protocol")
+  hourlyUsageMetrics: [UsageMetricsHourlySnapshot!]! @derivedFrom(field: "protocol")
+  financialMetrics: [FinancialsDailySnapshot!]! @derivedFrom(field: "protocol")
+  vaults: [Vault!]! @derivedFrom(field: "protocol")
+}
+
+type Vault @entity(immutable: false) {
+  id: ID!
+  protocol: YieldAggregator!
+  name: String
+  symbol: String
+  inputToken: Token!
+  outputToken: Token
+  depositLimit: BigInt!
+  createdTimestamp: BigInt!
+  createdBlockNumber: BigInt!
+  totalValueLockedUSD: BigDecimal!
+  cumulativeSupplySideRevenueUSD: BigDecimal!
+  cumulativeProtocolSideRevenueUSD: BigDecimal!
+  cumulativeTotalRevenueUSD: BigDecimal!
+  inputTokenBalance: BigInt!
+  outputTokenSupply: BigInt
+  outputTokenPriceUSD: BigDecimal
+  pricePerShare: BigDecimal
+  "Optional single-strategy address exposed by the vault implementation."
+  strategyAddress: String
+  "Null when a protocol does not expose one singular strategy contract."
+  strategyActive: Boolean
+  "ArcSet eligibility extension layered on the standardized vault entity."
+  eligibility: VaultEligibility!
+  eligibilityReason: String!
+  dailySnapshots: [VaultDailySnapshot!]! @derivedFrom(field: "vault")
+  hourlySnapshots: [VaultHourlySnapshot!]! @derivedFrom(field: "vault")
+  deposits: [Deposit!]! @derivedFrom(field: "vault")
+  withdraws: [Withdraw!]! @derivedFrom(field: "vault")
+}
+
+type UsageMetricsDailySnapshot @entity(immutable: false) {
+  id: ID!
+  protocol: YieldAggregator!
+  dailyActiveUsers: Int!
+  cumulativeUniqueUsers: Int!
+  dailyTransactionCount: Int!
+  dailyDepositCount: Int!
+  dailyWithdrawCount: Int!
+  totalPoolCount: Int!
+  blockNumber: BigInt!
+  timestamp: BigInt!
+}
+
+type UsageMetricsHourlySnapshot @entity(immutable: false) {
+  id: ID!
+  protocol: YieldAggregator!
+  hourlyActiveUsers: Int!
+  cumulativeUniqueUsers: Int!
+  hourlyTransactionCount: Int!
+  hourlyDepositCount: Int!
+  hourlyWithdrawCount: Int!
+  blockNumber: BigInt!
+  timestamp: BigInt!
+}
+
+type FinancialsDailySnapshot @entity(immutable: false) {
+  id: ID!
+  protocol: YieldAggregator!
+  totalValueLockedUSD: BigDecimal!
+  protocolControlledValueUSD: BigDecimal
+  dailySupplySideRevenueUSD: BigDecimal!
+  cumulativeSupplySideRevenueUSD: BigDecimal!
+  dailyProtocolSideRevenueUSD: BigDecimal!
+  cumulativeProtocolSideRevenueUSD: BigDecimal!
+  dailyTotalRevenueUSD: BigDecimal!
+  cumulativeTotalRevenueUSD: BigDecimal!
+  blockNumber: BigInt!
+  timestamp: BigInt!
+}
+
+type VaultDailySnapshot @entity(immutable: false) {
+  id: ID!
+  protocol: YieldAggregator!
+  vault: Vault!
+  totalValueLockedUSD: BigDecimal!
+  cumulativeSupplySideRevenueUSD: BigDecimal!
+  dailySupplySideRevenueUSD: BigDecimal!
+  cumulativeProtocolSideRevenueUSD: BigDecimal!
+  dailyProtocolSideRevenueUSD: BigDecimal!
+  cumulativeTotalRevenueUSD: BigDecimal!
+  dailyTotalRevenueUSD: BigDecimal!
+  inputTokenBalance: BigInt!
+  outputTokenSupply: BigInt!
+  outputTokenPriceUSD: BigDecimal
+  pricePerShare: BigDecimal
+  blockNumber: BigInt!
+  timestamp: BigInt!
+}
+
+type VaultHourlySnapshot @entity(immutable: false) {
+  id: ID!
+  protocol: YieldAggregator!
+  vault: Vault!
+  totalValueLockedUSD: BigDecimal!
+  cumulativeSupplySideRevenueUSD: BigDecimal!
+  hourlySupplySideRevenueUSD: BigDecimal!
+  cumulativeProtocolSideRevenueUSD: BigDecimal!
+  hourlyProtocolSideRevenueUSD: BigDecimal!
+  cumulativeTotalRevenueUSD: BigDecimal!
+  hourlyTotalRevenueUSD: BigDecimal!
+  inputTokenBalance: BigInt!
+  outputTokenSupply: BigInt!
+  outputTokenPriceUSD: BigDecimal
+  pricePerShare: BigDecimal
+  blockNumber: BigInt!
+  timestamp: BigInt!
+}
+
+type Deposit @entity(immutable: true) {
+  id: ID!
+  hash: String!
+  logIndex: Int!
+  protocol: YieldAggregator!
+  to: String!
+  from: String!
+  blockNumber: BigInt!
+  timestamp: BigInt!
+  asset: Token!
+  amount: BigInt!
+  amountUSD: BigDecimal!
+  shares: BigInt!
+  "Vault owner used for wallet-centric activity queries, including routed deposits."
+  account: Account!
+  vault: Vault!
+}
+
+type Withdraw @entity(immutable: true) {
+  id: ID!
+  hash: String!
+  logIndex: Int!
+  protocol: YieldAggregator!
+  to: String!
+  from: String!
+  blockNumber: BigInt!
+  timestamp: BigInt!
+  asset: Token!
+  amount: BigInt!
+  amountUSD: BigDecimal!
+  shares: BigInt!
+  "Vault owner used for wallet-centric activity queries, including routed withdrawals."
+  account: Account!
+  vault: Vault!
+}
+
+type Account @entity(immutable: false) { id: ID! }
+type ActiveAccount @entity(immutable: false) { id: ID! }

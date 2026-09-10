@@ -1,0 +1,34 @@
+query ArcYieldOverview {
+  yieldAggregators(first: 10) {
+    name
+    schemaVersion
+    methodologyVersion
+    totalValueLockedUSD
+    cumulativeUniqueUsers
+    totalPoolCount
+  }
+  vaults(first: 10) {
+    id
+    name
+    inputToken { symbol decimals }
+    inputTokenBalance
+    totalValueLockedUSD
+    pricePerShare
+    strategyAddress
+    strategyActive
+    eligibility
+    eligibilityReason
+    protocol { id name }
+  }
+}
+
+query WalletVaultActivity($account: String!) {
+  deposits(where: { account: $account }, orderBy: timestamp, orderDirection: desc) {
+    hash amount amountUSD shares timestamp account { id }
+    vault { id name protocol { id name } }
+  }
+  withdraws(where: { account: $account }, orderBy: timestamp, orderDirection: desc) {
+    hash amount amountUSD shares timestamp account { id }
+    vault { id name protocol { id name } }
+  }
+}
