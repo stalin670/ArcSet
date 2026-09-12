@@ -1,0 +1,127 @@
+import { ArcContractTables, DocsCallout } from "@/components/docs-content"
+
+export const metadata = {
+  title: { absolute: "Arc fundamentals — ArcSet Docs" },
+  description: "Arc network configuration, USDC-native accounting, EVM differences, and application contracts."
+}
+
+<div className="mb-10">
+  <p className="mb-3 font-mono text-xs font-bold uppercase tracking-[0.16em] text-primary">Network</p>
+</div>
+
+# Arc fundamentals
+
+Arc is an EVM-compatible Layer 1 built for programmable money. ArcSet currently targets Arc Testnet and treats Arc’s USDC-native model as an accounting invariant, not a cosmetic chain setting.
+
+## Network profile
+
+| Parameter | ArcSet value |
+| --- | --- |
+| Network | Arc Testnet |
+| Chain ID | `5042002` (`0x4CEF52`) |
+| Native currency | USDC |
+| Primary HTTP RPC | `https://rpc.testnet.arc.network` |
+| Primary WebSocket RPC | `wss://rpc.testnet.arc.network` |
+| Explorer | `https://testnet.arcscan.app` |
+| Faucet | `https://faucet.circle.com` |
+| EVM baseline | Osaka with Arc-specific runtime differences |
+| Finality | Deterministic on inclusion; one successful receipt |
+
+ArcSet imports `arcTestnet` from `viem/chains` and configures it as the only Wagmi and Privy chain. Server balance reads try the server override, public primary endpoint, and checked-in provider fallbacks in order.
+
+<DocsCallout kind="warning" title="Testnet only">
+  Do not infer future mainnet identifiers or addresses from these values. Keep chain IDs, RPC URLs, explorer URLs, and contracts centralized, and verify the official Arc pages before changing them.
+</DocsCallout>
+
+## One USDC balance, two interfaces
+
+Arc exposes the same underlying USDC balance through two representations:
+
+| Interface | Precision | Use in ArcSet |
+| --- | --- | --- |
+| Native USDC | 18 decimals | Gas accounting, native sends, and `msg.value` only |
+| USDC ERC-20 | 6 decimals | Balance display, transfers, approvals, allowances, allocations |
+
+They are not two assets. ArcSet never adds them, shows them as separate holdings, or offers a conversion between them. The raw values differ by `10^12`, so comparing them without converting produces incorrect accounting.
+
+```ts
+// Application balance and approval display
+formatUnits(usdcBalanceOf, 6)
+
+// Raw gas or msg.value accounting only
+formatUnits(nativeBalance, 18)
+```
+
+The ERC-20 view truncates values smaller than one micro-USDC. A zero ERC-20 `balanceOf` result therefore does not prove the native balance is mathematically zero.
+
+## EVM differences
+
+Arc targets the Osaka EVM baseline, but several behaviors differ from Ethereum.
+
+### Gas and fee market
+
+- fees are paid in native USDC with 18-decimal precision;
+- the testnet minimum base fee is 20 Gwei;
+- transactions below the fee floor can be dropped without a receipt;
+- the next base fee is published in the parent header `extra_data`;
+- base and priority fees are credited to the block beneficiary rather than burned;
+- the application shows fee values as USDC, never ETH.
+
+### Value transfers
+
+- non-zero transfers to `address(0)` revert;
+- transfers to or from blocklisted accounts revert and consume gas;
+- sending value to a previously self-destructed account can revert;
+- a contract forwarding native USDC is not guaranteed to succeed;
+- a transfer that completely drains a brand-new, zero-nonce account is a documented testnet limitation.
+
+### Opcodes and block data
+
+- `PREVRANDAO` returns zero and must not be used for randomness;
+- blob transactions are not supported;
+- withdrawals are always empty;
+- the EIP-4788 beacon-roots contract is omitted;
+- sub-second blocks can share timestamps, so use block numbers for ordering;
+- `SELFDESTRUCT` follows EIP-6780 plus Arc’s native-value restrictions.
+
+<DocsCallout kind="info" title="Finality model">
+  Arc transactions finalize on inclusion. ArcSet waits for one successful receipt and does not introduce Ethereum-style multi-confirmation counters unless an external integration requires them.
+</DocsCallout>
+
+## USDC events and indexing
+
+Native USDC movements emit standard `Transfer` logs from Arc’s system emitter using 18 decimals. An ERC-20 `transfer()` can also emit the familiar event from the 6-decimal USDC interface.
+
+An indexer must choose one canonical source. Counting both event streams double-counts ERC-20 transfers. ArcSet’s product model specifies the system emitter for a future complete transaction indexer, while the current application reads supported balances directly and stores only wallet-local execution attribution.
+
+## Contract addresses
+
+The tables below are rendered from the application’s centralized configuration and current Circle reference deployment.
+
+<ArcContractTables />
+
+<DocsCallout kind="warning" title="Official source of truth">
+  The application table describes the checked-in runtime configuration. Before deploying or changing an address, compare it with the official Arc Contract Addresses page and verify deployed bytecode on ArcScan.
+</DocsCallout>
+
+## Funding and wallet setup
+
+For the current testnet application:
+
+1. sign in through Privy;
+2. let Privy create the embedded EVM wallet;
+3. switch to Arc Testnet if required;
+4. copy the embedded address from the account menu;
+5. request Arc Testnet USDC from the Circle faucet or send testnet USDC directly;
+6. refresh the balance before requesting a quote.
+
+There is no separate ETH funding step. USDC funds both application actions and network fees.
+
+## Canonical Arc references
+
+- [Arc RPC endpoints](https://docs.arc.io/arc/references/rpc-endpoints)
+- [Connect to Arc](https://docs.arc.io/integrate/connect-to-arc)
+- [Stablecoin native model](https://docs.arc.io/arc/concepts/stablecoin-native-model)
+- [EVM differences](https://docs.arc.io/arc/references/evm-differences)
+- [Gas and fees](https://docs.arc.io/arc/references/gas-and-fees)
+- [Contract addresses](https://docs.arc.io/arc/references/contract-addresses)

@@ -1,0 +1,120 @@
+import { DocsCallout, SystemFlow } from "@/components/docs-content"
+
+export const metadata = {
+  title: { absolute: "Overview — ArcSet Docs" },
+  description: "Understand ArcSet and its product model."
+}
+
+<div className="mb-10">
+  <p className="mb-3 font-mono text-xs font-bold uppercase tracking-[0.16em] text-primary">ArcSet documentation</p>
+</div>
+
+# Invest in a thesis, directly from your wallet.
+
+ArcSet is a self-custodial DeFi portfolio application for Arc Testnet. Each set combines liquid assets and verified protocol positions around one understandable investment thesis.
+
+<DocsCallout kind="info" title="Current network scope">
+  ArcSet targets Arc Testnet. Every live quote, contract check, balance read, and transaction path is bound to chain ID `5042002`.
+</DocsCallout>
+
+## What ArcSet is
+
+ArcSet is a transparent route builder, not a pooled fund:
+
+- every basket has versioned target weights and a plain-language thesis;
+- the protocol registry admits only integrations with entry, valuation, position, and exit support;
+- the user reviews outputs, limits, fees, and risks;
+- Privy exposes the embedded Arc wallet used to sign;
+- assets and vault positions remain directly under the user's control;
+- the portfolio values recorded lots and calculates allocation drift.
+
+| Strategy | Return drivers | Execution |
+| --- | --- | --- |
+| Arc Dollar Yield | Morpho USDC vault | EarnKit deposit and withdrawal |
+| Bitcoin Income | cirBTC plus USDC income | App Kit swap plus EarnKit |
+| Global Reserve | USDC income plus EURC | EarnKit plus App Kit FX |
+| Arc Balanced | cirBTC, income, EURC, liquidity | Composite verified plan |
+
+<SystemFlow />
+
+## User journey
+
+1. Explore the curated basket catalog without connecting a wallet.
+2. Sign in with email, Google, or a supported EVM wallet.
+3. Use the embedded Arc address to request test USDC from the Circle Faucet.
+4. Inspect target weights, protocols, risk, liquidity, and time horizon.
+5. Request a fresh plan for the selected amount.
+6. Review every swap, minimum output, vault, APY, fee, and gas estimate.
+7. Confirm the reviewed plan once and follow each submitted step in ArcSet.
+8. Track wallet assets, vault value, transaction attribution, and allocation drift.
+9. Review a rebalance calculation when a basket moves away from target.
+
+## Product boundaries
+
+- APY is variable and never guaranteed.
+- Composite steps may complete partially; successful transactions are never automatically repeated.
+- Recorded attribution complements, but never replaces, live onchain balances.
+- Mock, restricted, prediction, and announced-only integrations stay out of the public catalog.
+- Rebalancing remains user reviewed and user approved.
+
+<DocsCallout kind="success" title="Protocol admission rule">
+  A strategy is live only when every leg has a verified entry, valuation, position read, protected execution rule, and tested exit path.
+</DocsCallout>
+
+## Mainnet Vision
+
+ArcSet is being designed to move from a focused Testnet strategy router into a liquidity-rich portfolio layer for Arc mainnet. Arc Public Mainnet is [scheduled for September 16, 2026](https://www.arc.io/blog/arc-mainnet-goes-live-on-september-16-2026).
+
+<DocsCallout kind="info" title="Roadmap, not current availability">
+  Uniswap is announced for Arc mainnet. Aave V4 remains subject to Aave governance, final risk review, deployment, official addresses, and live market conditions. ArcSet will not present either integration as executable until its complete entry-to-exit path is verified.
+</DocsCallout>
+
+### A liquidity-rich foundation
+
+Arc mainnet can bring three complementary forms of liquidity together:
+
+- **Trading liquidity:** [Uniswap will deploy on Arc](https://www.arc.io/blog/how-uniswap-brings-deep-liquidity-for-apps-on-arc), providing established AMM infrastructure for swaps, token discovery, liquidity provision, and structured products.
+- **Credit liquidity:** [Aave Labs has proposed Aave V4 on Arc](https://governance.aave.com/t/arfc-deploy-aave-v4-on-arc/25170), using a shared Core Hub with Main and Forex spokes designed to concentrate lending liquidity while separating market risk.
+- **Crosschain liquidity:** CCTP can bring canonical USDC into Arc, where the same asset can fund a basket, pay network fees, trade through Uniswap, or enter a verified lending market.
+
+This combination matters because liquidity is not limited to one pool. Uniswap can provide the trading and rebalancing venue, Aave can provide borrowing and lending demand, and Arc can settle both with USDC-denominated gas and deterministic sub-second finality.
+
+### Uniswap integration
+
+The current Base Sepolia route proves the CCTP and LP lifecycle. On Arc mainnet, ArcSet plans to replace that preview with an Arc-native Uniswap v4 adapter:
+
+1. quote swaps and liquidity positions directly on Arc;
+2. use the Universal Router for protected execution;
+3. support USDC-centered pools such as USDC/EURC, USDC/WETH, and USDC/cirBTC when official pools have sufficient liquidity;
+4. display pool liquidity, price impact, position range, accrued fees, and impermanent-loss risk;
+5. provide complete liquidity removal, fee collection, asset conversion, and basket exit paths;
+6. evaluate v4 hooks only when they provide a clear safety or strategy benefit.
+
+Keeping the full lifecycle on Arc removes the bridge wait and Base gas requirement from the current preview while preserving user-controlled LP ownership.
+
+### Aave V4 integration
+
+The proposed Aave V4 deployment starts with USDC, EURC, WETH, and cirBTC, one Core Liquidity Hub, a general Main Spoke, and a stablecoin-focused Forex Spoke. Its proposed tokenized supply-only spokes are particularly relevant to basket and vault integrations.
+
+ArcSet plans to use those markets for:
+
+- USDC and EURC lending allocations with live supply rates and utilization;
+- stablecoin FX and carry strategies built around the proposed Forex Spoke;
+- diversified income baskets combining Morpho and Aave rather than relying on one lending venue;
+- collateral-aware strategies using cirBTC or WETH only after liquidation, oracle, cap, and liquidity risks are clearly surfaced;
+- standardized Graph queries that compare eligible lending opportunities across protocols.
+
+Before activation, the adapter must verify the final governance approval, official contracts, supported assets, oracle configuration, caps, liquidity, supply and withdrawal behavior, valuation, and emergency conditions.
+
+### Mainnet basket direction
+
+The intended catalog is compact and differentiated:
+
+| Basket direction | Core integrations | Purpose |
+| --- | --- | --- |
+| Stable Income | Morpho + Aave V4 | Diversified USDC lending yield |
+| Arc FX Income | Aave Forex Spoke + Uniswap USDC/EURC | Stablecoin credit and currency exposure |
+| Arc Liquidity | Uniswap v4 LP + liquid USDC | Fee income with transparent range risk |
+| Bitcoin Income | cirBTC + Aave or Morpho + Uniswap | Growth exposure, lending income, and liquid execution |
+
+The Graph will remain the verification layer: indexing standardized market activity, comparing protocol health, reconstructing confirmed history, and preventing unavailable or ineligible markets from entering a live basket.

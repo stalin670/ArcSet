@@ -1,0 +1,67 @@
+import { DocsCallout, SecurityChecklist } from "@/components/docs-content"
+
+export const metadata = {
+  title: { absolute: "Execution model — ArcSet Docs" },
+  description: "How ArcSet verifies, quotes, executes, and records DeFi portfolio strategies."
+}
+
+<div className="mb-10">
+  <p className="mb-3 font-mono text-xs font-bold uppercase tracking-[0.16em] text-primary">Transactions</p>
+</div>
+
+# Execution model
+
+Every basket follows the same trust sequence: validate the wallet, allocate USDC, verify every adapter, construct fresh quotes, show the complete plan, request one explicit confirmation, and record every submitted transaction and confirmed Arc receipt.
+
+## Shared transaction lifecycle
+
+| Phase | User interface | System behavior |
+| --- | --- | --- |
+| Entry | Amount and wallet state | Rejects malformed or insufficient USDC |
+| Quoting | Route verification progress | Loads current swaps, vault, fees, gas, and limits |
+| Review | Complete allocation plan | Preserves minimum outputs and exact destinations |
+| Signing | Per-step wallet progress | Submits only after explicit approval |
+| Complete | Receipt links and portfolio action | Refreshes live balances and records attribution |
+| Partial | Completed and remaining steps | Stops immediately and never repeats a completed action |
+| Error | Inline recovery | Preserves safe state and explains the next action |
+
+<DocsCallout kind="warning" title="Quotes expire">
+  Swap and earn quotes are time-bound. Stale remaining steps cannot be retried from an old plan.
+</DocsCallout>
+
+## App Kit swaps
+
+App Kit quotes USDC into EURC or cirBTC with permit-first authorization and a 1% stop limit. Reviews show amount in, estimated output, minimum output, and provider fees. Reverse-token support exists in the adapter for future rebalance execution, but no route bypasses a fresh quote.
+
+## EarnKit vaults
+
+A usable vault must be active on Arc Testnet, use official Arc USDC, exclude “mock” from its name, expose no red risk warning, and report a finite APY. The client then verifies deployed bytecode and the ERC-4626 `asset()`, `decimals()`, and `totalAssets()` calls.
+
+Deposits show expected shares, share price, fees, gas, and the current variable APY. Withdrawals rediscover the vault and quote the current maximum withdrawable amount before signing.
+
+## Composite baskets
+
+Composite baskets combine wallet custody, swaps, and a Morpho vault deposit in one reviewed plan. All legs are quoted together, then executed sequentially because the current wallet and protocol routes cannot safely guarantee one atomic transaction.
+
+After every receipt, ArcSet writes the completed step to the execution record. If a later step fails, the user sees:
+
+- which allocations finalized;
+- their ArcScan links;
+- how many steps remain;
+- a retry action limited to those remaining steps while quotes are still fresh.
+
+## Positions and receipts
+
+Onchain reads remain authoritative for USDC, EURC, cirBTC, and the current EarnKit position. Versioned browser records associate executions with a wallet, basket, target version, amounts, status, and transaction hashes.
+
+Arc provides deterministic finality on inclusion, so the interface does not use Ethereum-style multi-confirmation counters.
+
+## Rebalancing
+
+The portfolio values recorded basket lots with current reference prices, calculates actual weights, and marks baskets whose maximum absolute drift reaches five percentage points. The review expands into explicit buy or sell values for every leg.
+
+Self-custodied assets can be moved outside ArcSet, so the plan is advisory until reconfirmed against wallet balances and fresh protocol quotes. Automatic rebalancing is disabled.
+
+## Execution safety checklist
+
+<SecurityChecklist />
