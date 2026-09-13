@@ -1,4 +1,7 @@
+import { createPositionStore } from "./position-store";
+
 export const CROSS_CHAIN_POSITION_STORAGE_KEY = "arc-set:cross-chain-positions:v1";
+export const CROSS_CHAIN_POSITION_QUARANTINE_STORAGE_KEY = "arc-set:cross-chain-positions:quarantine:v1";
 const PREVIOUS_CROSS_CHAIN_POSITION_STORAGE_KEY = "arc-basket:cross-chain-positions:v1";
 export const CROSS_CHAIN_POSITION_UPDATED_EVENT = "arc-set:cross-chain-positions-updated";
 
@@ -70,28 +73,38 @@ export function parseCrossChainPositions(serialized: string | null): CrossChainB
   return parsed;
 }
 
+export function recoverCrossChainPositions(serialized: string | null) {
+  if (!serialized) return { positions: [] as CrossChainBasketPosition[], invalidCount: 0, recovered: false };
+  try {
+    const value: unknown = JSON.parse(serialized);
+    if (!Array.isArray(value)) throw new TypeError("Expected saved positions.");
+    const positions = value.filter(isCrossChainBasketPosition);
+    const invalidCount = value.length - positions.length;
+    return { positions, invalidCount, recovered: invalidCount > 0 };
+  } catch {
+    return { positions: [] as CrossChainBasketPosition[], invalidCount: 1, recovered: true };
+  }
+}
+
+const positionStore = createPositionStore<CrossChainBasketPosition>({
+  key: CROSS_CHAIN_POSITION_STORAGE_KEY,
+  previousKeys: [PREVIOUS_CROSS_CHAIN_POSITION_STORAGE_KEY],
+  quarantineKey: CROSS_CHAIN_POSITION_QUARANTINE_STORAGE_KEY,
+  event: CROSS_CHAIN_POSITION_UPDATED_EVENT,
+  recover: recoverCrossChainPositions,
+});
+
 export function readCrossChainPositions() {
-  if (typeof window === "undefined") return [];
-  const current = window.localStorage.getItem(CROSS_CHAIN_POSITION_STORAGE_KEY);
-  if (current) return parseCrossChainPositions(current);
-  const previous = window.localStorage.getItem(PREVIOUS_CROSS_CHAIN_POSITION_STORAGE_KEY);
-  const migrated = parseCrossChainPositions(previous);
-  if (previous) window.localStorage.setItem(CROSS_CHAIN_POSITION_STORAGE_KEY, JSON.stringify(migrated));
-  return migrated;
+  return typeof window === "undefined" ? [] : positionStore.read();
 }
 
 export function saveCrossChainPosition(position: CrossChainBasketPosition) {
-  if (typeof window === "undefined") return;
-  const current = readCrossChainPositions().filter((item) => item.id !== position.id);
-  window.localStorage.setItem(CROSS_CHAIN_POSITION_STORAGE_KEY, JSON.stringify([position, ...current]));
-  window.dispatchEvent(new Event(CROSS_CHAIN_POSITION_UPDATED_EVENT));
+  if (!isCrossChainBasketPosition(position)) throw new TypeError("Saved cross-chain position data is invalid.");
+  positionStore.update((current) => [position, ...current.filter((item) => item.id !== position.id)]);
 }
 
 export function removeCrossChainPosition(id: string) {
-  if (typeof window === "undefined") return;
-  const remaining = readCrossChainPositions().filter((position) => position.id !== id);
-  window.localStorage.setItem(CROSS_CHAIN_POSITION_STORAGE_KEY, JSON.stringify(remaining));
-  window.dispatchEvent(new Event(CROSS_CHAIN_POSITION_UPDATED_EVENT));
+  positionStore.update((current) => current.filter((position) => position.id !== id));
 }
 
 export function crossChainPositionsForWallet(positions: CrossChainBasketPosition[], walletAddress: string) {

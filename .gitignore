@@ -8,6 +8,7 @@ coverage/
 *.tsbuildinfo
 *.md
 !/README.md
+!/CONTEXT.md
 graph/arc-yield/node_modules/
 graph/arc-yield/generated/
 graph/arc-yield/build/

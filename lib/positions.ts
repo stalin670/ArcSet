@@ -1,5 +1,6 @@
 import { formatUnits, parseUnits } from "viem";
 import { ARC_TESTNET } from "./arc";
+import { createPositionStore } from "./position-store";
 
 export const POSITION_STORAGE_KEY = "arc-set:positions:v2";
 const PREVIOUS_POSITION_STORAGE_KEY = "arc-basket:positions:v2";
@@ -214,72 +215,30 @@ export function recoverStoredPositions(serialized: string | null) {
   }
 }
 
-function quarantineInvalidPositionData(sourceKey: string, serialized: string) {
-  if (typeof window === "undefined") return;
-  try {
-    const existingRaw = window.localStorage.getItem(POSITION_QUARANTINE_STORAGE_KEY);
-    const existing: unknown = existingRaw ? JSON.parse(existingRaw) : [];
-    const entries = Array.isArray(existing) ? existing.slice(0, 4) : [];
-    window.localStorage.setItem(POSITION_QUARANTINE_STORAGE_KEY, JSON.stringify([
-      { sourceKey, serialized, quarantinedAt: Date.now() },
-      ...entries,
-    ]));
-  } catch {
-    // A backup must never prevent a confirmed onchain action from being recorded.
-  }
-}
-
-function readAndRecoverPositionData(sourceKey: string, serialized: string) {
-  const result = recoverStoredPositions(serialized);
-  if (result.recovered) {
-    quarantineInvalidPositionData(sourceKey, serialized);
-    try {
-      window.localStorage.setItem(POSITION_STORAGE_KEY, JSON.stringify(result.positions));
-    } catch {
-      // Return the in-memory recovery even when the browser storage quota is unavailable.
-    }
-  }
-  return result.positions;
-}
+const positionStore = createPositionStore<StoredBasketPosition>({
+  key: POSITION_STORAGE_KEY,
+  previousKeys: [PREVIOUS_POSITION_STORAGE_KEY, LEGACY_POSITION_STORAGE_KEY],
+  quarantineKey: POSITION_QUARANTINE_STORAGE_KEY,
+  event: POSITION_UPDATED_EVENT,
+  recover: recoverStoredPositions,
+});
 
 export function readStoredPositions() {
-  if (typeof window === "undefined") return [];
-  const current = window.localStorage.getItem(POSITION_STORAGE_KEY);
-  if (current) return readAndRecoverPositionData(POSITION_STORAGE_KEY, current);
-
-  const previous = window.localStorage.getItem(PREVIOUS_POSITION_STORAGE_KEY);
-  if (previous) {
-    const migrated = readAndRecoverPositionData(PREVIOUS_POSITION_STORAGE_KEY, previous);
-    window.localStorage.setItem(POSITION_STORAGE_KEY, JSON.stringify(migrated));
-    return migrated;
-  }
-
-  const legacy = window.localStorage.getItem(LEGACY_POSITION_STORAGE_KEY);
-  const migrated = legacy ? readAndRecoverPositionData(LEGACY_POSITION_STORAGE_KEY, legacy) : [];
-  if (legacy) window.localStorage.setItem(POSITION_STORAGE_KEY, JSON.stringify(migrated));
-  return migrated;
+  return typeof window === "undefined" ? [] : positionStore.read();
 }
 
 export function recordBasketPosition(position: StoredBasketPosition) {
-  if (typeof window === "undefined") return;
-  const current = readStoredPositions();
-  const transactionHashes = new Set(position.legs.map((leg) => leg.transactionHash.toLowerCase()));
-  const withoutDuplicate = current.filter((item) => (
-    item.id !== position.id &&
-    !item.legs.some((leg) => transactionHashes.has(leg.transactionHash.toLowerCase()))
-  ));
-  try {
-    window.localStorage.setItem(POSITION_STORAGE_KEY, JSON.stringify([position, ...withoutDuplicate]));
-  } catch {
-    return;
-  }
-  window.dispatchEvent(new Event(POSITION_UPDATED_EVENT));
+  if (!isStoredBasketPosition(position)) throw new TypeError("Saved position data is invalid.");
+  positionStore.update((current) => {
+    const hashes = new Set(position.legs.map((leg) => leg.transactionHash.toLowerCase()));
+    return [position, ...current.filter((item) => item.id !== position.id &&
+      !item.legs.some((leg) => hashes.has(leg.transactionHash.toLowerCase())))];
+  });
 }
 
 export function replaceStoredPositions(positions: StoredBasketPosition[]) {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(POSITION_STORAGE_KEY, JSON.stringify(positions));
-  window.dispatchEvent(new Event(POSITION_UPDATED_EVENT));
+  if (!positions.every(isStoredBasketPosition)) throw new TypeError("Saved position data is invalid.");
+  positionStore.write(positions);
 }
 
 export type TransactionResolution = "pending" | "confirmed" | "reverted";
@@ -309,12 +268,14 @@ export function reconcileStoredPositions(
 }
 
 export function clearStoredPositions() {
-  if (typeof window === "undefined") return;
-  window.localStorage.removeItem(POSITION_STORAGE_KEY);
-  window.localStorage.removeItem(PREVIOUS_POSITION_STORAGE_KEY);
-  window.localStorage.removeItem(LEGACY_POSITION_STORAGE_KEY);
-  window.localStorage.removeItem(POSITION_QUARANTINE_STORAGE_KEY);
-  window.dispatchEvent(new Event(POSITION_UPDATED_EVENT));
+  positionStore.clear();
+}
+
+export function reconcilePositionReceipts(resolutions: Readonly<Record<string, TransactionResolution>>) {
+  return positionStore.update((latest) => {
+    const next = reconcileStoredPositions(latest, resolutions);
+    return next.some((position, index) => position !== latest[index]) ? next : latest;
+  });
 }
 
 export function positionsForWallet(positions: StoredBasketPosition[], address: string) {

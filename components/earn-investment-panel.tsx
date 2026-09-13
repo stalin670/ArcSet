@@ -18,13 +18,14 @@ import { allocateBasketAmount, parseBasketUsdcAmount } from "@/lib/basket-amount
 import { ARC_TESTNET } from "@/lib/arc";
 import type { Basket } from "@/lib/baskets";
 import { recordBasketPosition } from "@/lib/positions";
+import { createArcExecutionState, executeArcBasketSteps } from "@/lib/arc-basket-execution";
 
-const QUOTE_TTL_MS = 30_000;
 type EarnMode = "deposit" | "withdraw";
 type EarnPhase = "entry" | "quoting" | "review" | "executing" | "success";
 
 function userFacingEarnError(error: unknown, action: "quote" | "execute" | "position") {
   const message = error instanceof Error ? error.message.toLowerCase() : "";
+  if (error instanceof Error && message.includes("submission outcome is unknown")) return error.message;
   if (message.includes("reject") || message.includes("denied") || message.includes("cancel")) {
     return "Transaction cancelled. No unconfirmed position was recorded.";
   }
@@ -46,8 +47,10 @@ export function EarnInvestmentPanel({ basket }: { basket: Basket }) {
   const [quote, setQuote] = useState<ArcEarnQuote | null>(null);
   const [execution, setExecution] = useState<ArcEarnExecution | null>(null);
   const [error, setError] = useState("");
+  const [needsRecording, setNeedsRecording] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const executionPendingRef = useRef(false);
+  const executionState = useRef(createArcExecutionState<ArcEarnExecution>());
 
   async function getProvider() {
     if (wallet.status !== "ready" || !wallet.getEthereumProvider) {
@@ -78,6 +81,8 @@ export function EarnInvestmentPanel({ basket }: { basket: Basket }) {
   }
 
   function reset(nextMode: EarnMode = mode) {
+    setNeedsRecording(false);
+    executionState.current = createArcExecutionState<ArcEarnExecution>();
     setMode(nextMode);
     setPhase("entry");
     setQuote(null);
@@ -136,47 +141,65 @@ export function EarnInvestmentPanel({ basket }: { basket: Basket }) {
   async function executeQuote() {
     if (!quote || executionPendingRef.current) return;
     setError("");
-    if (Date.now() - quote.quotedAt > QUOTE_TTL_MS) {
-      setError("This quote expired. Return and request a fresh quote before signing.");
-      return;
-    }
-
     executionPendingRef.current = true;
     setPhase("executing");
     try {
-      const result = await executeArcEarnQuote(await getProvider(), quote);
-      if (result.kind === "deposit" && quote.kind === "deposit" && wallet.address) {
-        const parsed = parseBasketUsdcAmount(amount);
-        const retainedUsdc = allocateBasketAmount(basket.legs, parsed).find(({ leg }) => leg.execution === "hold")?.value ?? "0";
-        recordBasketPosition({
-          schemaVersion: 2,
-          id: result.txHash.toLowerCase(),
-          walletAddress: wallet.address,
-          basketSlug: basket.slug,
-          basketVersion: basket.version,
-          chainId: ARC_TESTNET.id,
-          investedUsdc: amount,
-          retainedUsdc,
-          status: "complete",
-          legs: [{
-            name: quote.vault.name,
-            outputToken: "EARN-USDC",
-            amountInUsdc: quote.amountIn,
-            outputAmount: result.amount,
-            outputAmountSource: "actual",
-            transactionHash: result.txHash,
-            status: "complete",
-          }],
-          createdAt: Date.now(),
-        });
-      }
+      const provider = await getProvider();
+      const outcome = await executeArcBasketSteps({
+        state: executionState.current,
+        steps: [quote],
+        id: () => "earn",
+        quote: async (reviewed) => reviewed.kind === "deposit" ? quoteArcEarnDeposit(provider, reviewed.amountIn) : quoteArcEarnWithdrawal(provider, reviewed.amountOut),
+        execute: async (_reviewed, fresh) => ({ status: "complete" as const, value: await executeArcEarnQuote(provider, fresh) }),
+        record: (outcomes) => {
+          const result = outcomes[0].value;
+          if (result.kind === "deposit" && quote.kind === "deposit" && wallet.address) {
+            const parsed = parseBasketUsdcAmount(amount);
+            const retainedUsdc = allocateBasketAmount(basket.legs, parsed).find(({ leg }) => leg.execution === "hold")?.value ?? "0";
+            recordBasketPosition({
+              schemaVersion: 2,
+              id: result.txHash.toLowerCase(),
+              walletAddress: wallet.address,
+              basketSlug: basket.slug,
+              basketVersion: basket.version,
+              chainId: ARC_TESTNET.id,
+              investedUsdc: amount,
+              retainedUsdc,
+              status: "complete",
+              legs: [{
+                name: quote.vault.name,
+                outputToken: "EARN-USDC",
+                amountInUsdc: quote.amountIn,
+                outputAmount: result.amount,
+                outputAmountSource: "actual",
+                transactionHash: result.txHash,
+                status: "complete",
+              }],
+              createdAt: Date.now(),
+            });
+          }
+        },
+      });
+      const result = executionState.current.outcomes[0]?.value;
+      if (!result) return;
       setExecution(result);
       setPhase("success");
-      await Promise.all([wallet.refreshBalance(), position.refetch()]);
+      if (outcome.status === "recording-failed") setError("Transaction confirmed, but its local record could not be saved. Keep the receipt before leaving this page.");
+      await Promise.all([wallet.refreshBalance(), position.refetch()]).catch(() => {
+        if (outcome.status !== "recording-failed") setError("Transaction confirmed. Balance refresh is temporarily unavailable.");
+      });
     } catch (executeError) {
-      setError(userFacingEarnError(executeError, "execute"));
-      setPhase("review");
+      const confirmed = executionState.current.outcomes[0]?.value;
+      if (confirmed) {
+        setExecution(confirmed);
+        setError("Transaction confirmed, but its local receipt still needs saving. Reconnect the wallet and retry saving.");
+        setPhase("success");
+      } else {
+        setError(userFacingEarnError(executeError, "execute"));
+        setPhase("review");
+      }
     } finally {
+      setNeedsRecording(Boolean(executionState.current.needsRecording));
       executionPendingRef.current = false;
     }
   }
@@ -194,6 +217,8 @@ export function EarnInvestmentPanel({ basket }: { basket: Basket }) {
   if (phase === "success" && execution) {
     return (
       <PanelShell title={execution.kind === "deposit" ? "Deposit confirmed" : "Withdrawal confirmed"} eyebrow="ONCHAIN">
+        {error ? <p role="alert" className="mb-4 text-sm text-destructive">{error}</p> : null}
+        {needsRecording ? <button type="button" onClick={() => void executeQuote()} className="focus-ring mb-4 min-h-10 rounded-lg bg-secondary px-3 text-sm font-bold">Retry saving receipt</button> : null}
         <div className="flex items-start gap-3">
           <span className="grid size-10 shrink-0 place-items-center rounded-full bg-accent text-accent-foreground"><Check aria-hidden="true" size={19} /></span>
           <div>
@@ -203,7 +228,7 @@ export function EarnInvestmentPanel({ basket }: { basket: Basket }) {
         </div>
         <div className="mt-5 grid gap-2">
           <a href={execution.explorerUrl} target="_blank" rel="noreferrer" className="focus-ring inline-flex min-h-11 items-center justify-center gap-2 rounded-[var(--radius-control)] bg-primary px-4 text-sm font-extrabold text-primary-foreground">View transaction <ArrowUpRight aria-hidden="true" size={16} /></a>
-          <button type="button" onClick={() => reset(execution.kind === "deposit" && hasPosition ? "withdraw" : "deposit")} className="focus-ring min-h-11 rounded-[var(--radius-control)] bg-secondary px-4 text-sm font-bold">{execution.kind === "deposit" ? "Manage position" : "Make another deposit"}</button>
+          <button type="button" onClick={() => reset(execution.kind === "deposit" && hasPosition ? "withdraw" : "deposit")} disabled={needsRecording} className="focus-ring min-h-11 rounded-[var(--radius-control)] bg-secondary px-4 text-sm font-bold">{execution.kind === "deposit" ? "Manage position" : "Make another deposit"}</button>
         </div>
       </PanelShell>
     );
