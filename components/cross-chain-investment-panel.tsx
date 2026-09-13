@@ -1,40 +1,20 @@
 "use client";
 
-import { type FormEvent, useRef, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { AlertTriangle, ArrowUpRight, Check, LoaderCircle, Route, ShieldCheck, Wallet } from "lucide-react";
-import type { BridgeResult } from "@circle-fin/app-kit";
 import { formatUnits, parseUnits, type EIP1193Provider } from "viem";
 import { useArcWallet } from "@/components/arc-wallet-context";
 import { FormattedNumber } from "@/components/formatted-number";
-import { executeArcEarnQuote, quoteArcEarnDeposit, type ArcEarnDepositQuote } from "@/lib/arc-earn-client";
-import { executeBaseUniswapSwap, mintBaseWideRangePosition, quoteBaseUniswapSwap, readBaseWalletPreflight, type BaseLpExecution, type BaseSwapExecution, type BaseSwapQuote } from "@/lib/base-uniswap-client";
+import { quoteArcEarnDeposit } from "@/lib/arc-earn-client";
+import { quoteBaseUniswapSwap, readBaseWalletPreflight, type BaseLpExecution } from "@/lib/base-uniswap-client";
 import { allocateBasketAmount, parseBasketUsdcAmount } from "@/lib/basket-amount";
 import type { Basket } from "@/lib/baskets";
-import { bridgeTransactionSteps, executeCctpBridge, quoteCctpBridge, retryCctpBridge, type CctpBridgeQuote } from "@/lib/cctp-client";
-import { saveCrossChainPosition } from "@/lib/cross-chain-positions";
+import { quoteCctpBridge } from "@/lib/cctp-client";
+import { createRoute, readRoute, type RouteRecord } from "@/lib/cross-chain-route";
+import { entryRouteStage, executeEntryRoute, type EntryPlan } from "@/lib/cross-chain-route-execution";
 
 type Phase = "entry" | "quoting" | "review" | "executing" | "partial" | "success";
-type Plan = {
-  earn: ArcEarnDepositQuote;
-  bridge: CctpBridgeQuote;
-  swap: BaseSwapQuote;
-  total: string;
-  morpho: string;
-  base: string;
-  retained: string;
-  swapUsdc: string;
-  baseStartingUsdc: string;
-};
-type Progress = {
-  stage: number;
-  morphoHash?: `0x${string}`;
-  bridgeResult?: BridgeResult;
-  swap?: BaseSwapExecution;
-  lp?: BaseLpExecution;
-  baseReceived?: string;
-};
-
 const MIN_CROSS_CHAIN_USDC = 10;
 const MAX_CROSS_CHAIN_USDC = 100;
 
@@ -61,13 +41,35 @@ export function CrossChainInvestmentPanel({ basket }: { basket: Basket }) {
   const wallet = useArcWallet();
   const [amount, setAmount] = useState("10");
   const [phase, setPhase] = useState<Phase>("entry");
-  const [plan, setPlan] = useState<Plan | null>(null);
+  const [plan, setPlan] = useState<EntryPlan | null>(null);
   const [stage, setStage] = useState(0);
   const [lpResult, setLpResult] = useState<BaseLpExecution | null>(null);
   const [error, setError] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
   const lock = useRef(false);
-  const progress = useRef<Progress>({ stage: 0 });
+  const route = useRef<RouteRecord<EntryPlan> | null>(null);
+  const recoveryBlocked = useRef(false);
+  const [submissionUnknown, setSubmissionUnknown] = useState(false);
+  const [recoveryUnavailable, setRecoveryUnavailable] = useState(false);
+
+  useEffect(() => {
+    const recovery = requestAnimationFrame(() => {
+    route.current = null;
+    recoveryBlocked.current = false;
+    setSubmissionUnknown(false); setRecoveryUnavailable(false);
+    setPlan(null); setStage(0); setPhase("entry"); setError("");
+    if (!wallet.address || !wallet.baseAddress) return;
+    try {
+      const saved = readRoute<EntryPlan>(wallet.address, wallet.baseAddress, "entry:" + basket.slug);
+      if (saved && !saved.complete) {
+        setSubmissionUnknown(Boolean(saved.pending));
+        route.current = saved; setPlan(saved.plan); setStage(entryRouteStage(saved)); setPhase("partial");
+        setError(saved.pending ? "A submission was interrupted. Its outcome must be checked in wallet history before continuing; it will not be repeated automatically." : "Recovered your saved route. Resume the next unfinished step.");
+      }
+    } catch (cause) { recoveryBlocked.current = true; setRecoveryUnavailable(true); setError(cause instanceof Error ? cause.message : "Route recovery is unavailable."); }
+    });
+    return () => cancelAnimationFrame(recovery);
+  }, [wallet.address, wallet.baseAddress, basket.slug]);
 
   async function provider() {
     if (!wallet.getEthereumProvider) throw new Error("Sign in to the Circle wallet first.");
@@ -87,12 +89,13 @@ export function CrossChainInvestmentPanel({ basket }: { basket: Basket }) {
     setStage(0);
     setError("");
     setLpResult(null);
-    progress.current = { stage: 0 };
+    route.current = null;
     requestAnimationFrame(() => inputRef.current?.focus());
   }
 
   async function requestPlan(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (recoveryBlocked.current) return;
     setError("");
     let parsed: bigint;
     try {
@@ -124,7 +127,7 @@ export function CrossChainInvestmentPanel({ basket }: { basket: Basket }) {
       ]);
       const swapUsdc = formatUnits(parseUnits(bridge.amountReceived, 6) / 2n, 6);
       const swap = await quoteBaseUniswapSwap(swapUsdc);
-      setPlan({ earn, bridge, swap, baseStartingUsdc: baseWallet.usdc, total: formatUnits(parsed, 6), morpho, base, swapUsdc, retained: computeRetained(formatUnits(parsed, 6), morpho, bridge.totalDebit) });
+      setPlan({ basketVersion: basket.version, earn, bridge, swap, baseStartingUsdc: baseWallet.usdc, total: formatUnits(parsed, 6), morpho, base, swapUsdc, retained: computeRetained(formatUnits(parsed, 6), morpho, bridge.totalDebit) });
       setPhase("review");
     } catch (cause) {
       setError(executionError(cause, 0));
@@ -132,99 +135,22 @@ export function CrossChainInvestmentPanel({ basket }: { basket: Basket }) {
     }
   }
 
-  function advance(next: number) {
-    progress.current.stage = next;
-    setStage(next);
-  }
-
   async function execute() {
-    if (!plan || !wallet.address || !wallet.baseAddress || lock.current) return;
+    if (!plan || !wallet.address || !wallet.baseAddress || lock.current || recoveryBlocked.current) return;
     lock.current = true;
-    setError("");
-    setPhase("executing");
+    setError(""); setPhase("executing");
     try {
-      if (progress.current.stage < 1) {
-        await wallet.switchToArc();
-        const walletProvider = await provider();
-        const freshEarn = await quoteArcEarnDeposit(walletProvider, plan.morpho);
-        const earnResult = await executeArcEarnQuote(walletProvider, freshEarn);
-        progress.current.morphoHash = earnResult.txHash;
-        advance(1);
-      }
-      if (progress.current.stage < 2) {
-        await wallet.switchToArc();
-        const walletProvider = await provider();
-        let bridgeResult = progress.current.bridgeResult;
-        if (!bridgeResult) {
-          const freshBridge = await quoteCctpBridge(walletProvider, "arc-to-base", wallet.baseAddress, plan.base);
-          bridgeResult = await executeCctpBridge(walletProvider, freshBridge);
-        } else if (bridgeResult.state !== "success") {
-          bridgeResult = await retryCctpBridge(walletProvider, bridgeResult);
-        }
-        progress.current.bridgeResult = bridgeResult;
-        if (bridgeResult.state !== "success") throw new Error("CCTP bridge stopped before completion.");
-        const baseWallet = await readBaseWalletPreflight(wallet.baseAddress);
-        const received = parseUnits(baseWallet.usdc, 6) - parseUnits(plan.baseStartingUsdc, 6);
-        if (received <= 0n) throw new Error("CCTP completed but no new canonical USDC was detected on Base Sepolia.");
-        progress.current.baseReceived = formatUnits(received, 6);
-        advance(2);
-      }
-      if (progress.current.stage < 3) {
-        await wallet.switchToBase();
-        const walletProvider = await provider();
-        if (!progress.current.baseReceived) throw new Error("The net CCTP receipt on Base is unavailable.");
-        const actualSwapUsdc = formatUnits(parseUnits(progress.current.baseReceived, 6) / 2n, 6);
-        const freshSwap = await quoteBaseUniswapSwap(actualSwapUsdc);
-        progress.current.swap = await executeBaseUniswapSwap(walletProvider, freshSwap);
-        advance(3);
-      }
-      if (progress.current.stage < 4) {
-        await wallet.switchToBase();
-        const walletProvider = await provider();
-        if (!progress.current.swap) throw new Error("The confirmed Uniswap swap output is missing.");
-        if (!progress.current.baseReceived) throw new Error("The net CCTP receipt on Base is unavailable.");
-        const actualSwapUsdc = formatUnits(parseUnits(progress.current.baseReceived, 6) / 2n, 6);
-        const usdcForLp = formatUnits(parseUnits(progress.current.baseReceived, 6) - parseUnits(actualSwapUsdc, 6), 6);
-        progress.current.lp = await mintBaseWideRangePosition(walletProvider, usdcForLp, progress.current.swap.amountOut);
-        advance(4);
-      }
-      const result = progress.current;
-      if (!result.morphoHash || !result.bridgeResult || !result.swap || !result.lp) throw new Error("The completed route is missing receipt data.");
-      const actualBaseReceived = result.baseReceived ?? plan.bridge.amountReceived;
-      const actualSwapUsdc = formatUnits(parseUnits(actualBaseReceived, 6) / 2n, 6);
-      saveCrossChainPosition({
-        schemaVersion: 1,
-        id: `${basket.slug}:${result.lp.tokenId}`,
-        walletAddress: wallet.address,
-        basketSlug: "cross-chain-liquidity-preview",
-        basketVersion: basket.version,
-        investedUsdc: plan.total,
-        retainedUsdc: plan.retained,
-        morphoUsdc: plan.morpho,
-        baseUsdc: actualBaseReceived,
-        morphoTransactionHash: result.morphoHash,
-        bridgeTransactionHashes: bridgeTransactionSteps(result.bridgeResult).map((step) => step.txHash as `0x${string}`),
-        swapTransactionHash: result.swap.swapHash,
-        mintTransactionHash: result.lp.mintHash,
-        tokenId: result.lp.tokenId,
-        liquidity: result.lp.liquidity,
-        depositedUsdc: result.lp.amountUsdc,
-        depositedWeth: result.lp.amountWeth,
-        residualUsdc: formatUnits(parseUnits(actualBaseReceived, 6) - parseUnits(actualSwapUsdc, 6) - parseUnits(result.lp.amountUsdc, 6), 6),
-        residualWeth: formatUnits(parseUnits(result.swap.amountOut, 18) - parseUnits(result.lp.amountWeth, 18), 18),
-        status: "active",
-        createdAt: Date.now(),
-      });
-      await wallet.switchToArc();
-      await wallet.refreshBalance();
-      setLpResult(result.lp);
-      setPhase("success");
+      const saved = route.current ?? createRoute(wallet.address, wallet.baseAddress, "entry:" + basket.slug, plan);
+      route.current = saved;
+      setPlan(saved.plan);
+      const result = await executeEntryRoute(saved, { provider, switchToArc: wallet.switchToArc, switchToBase: wallet.switchToBase }, setStage);
+      setLpResult(result); setPhase("success");
+      void wallet.switchToArc().then(() => wallet.refreshBalance()).catch(() => {});
     } catch (cause) {
-      setError(executionError(cause, progress.current.stage));
-      setPhase(progress.current.stage ? "partial" : "review");
-    } finally {
-      lock.current = false;
-    }
+      setError(cause instanceof Error ? cause.message : "Execution paused. Saved steps will not be repeated.");
+      setSubmissionUnknown(Boolean(route.current?.pending));
+      setPhase(route.current ? "partial" : "review");
+    } finally { lock.current = false; }
   }
 
   const walletLabel = wallet.status === "wrong-chain" ? "Switch to Arc" : wallet.status === "wallet-missing" ? "Retry Circle wallet" : wallet.status === "signed-out" ? "Sign in with passkey" : "Loading wallet…";
@@ -234,10 +160,10 @@ export function CrossChainInvestmentPanel({ basket }: { basket: Basket }) {
   }
 
   if ((phase === "review" || phase === "executing" || phase === "partial") && plan) {
-    return <Panel title={phase === "review" ? "Review cross-chain plan" : phase === "partial" ? "Route paused" : "Executing route"} eyebrow="EXPERIMENTAL"><dl className="divide-y divide-border rounded-xl bg-muted px-4"><Row label="Total investment" value={plan.total} token="USDC" /><Row label="Morpho on Arc" value={plan.morpho} token="USDC" /><Row label="CCTP to Base" value={plan.base} token="USDC" /><Row label="Estimated bridge fee" value={plan.bridge.feeTotal} token="USDC" /><Row label="Estimated Arc reserve" value={plan.retained} token="USDC" /><Row label="Uniswap swap" value={plan.swapUsdc} token="USDC" /><Row label="Minimum WETH" value={plan.swap.minimumOutput} token="WETH" price={plan.swap.minimumOutput === "0" ? undefined : Number(plan.swapUsdc) / Number(plan.swap.minimumOutput)} /></dl><div className="mt-4 space-y-2">{["Deposit to Morpho on Arc", "Bridge USDC with CCTP", "Swap half to WETH on Base", "Mint wide-range Uniswap V3 NFT"].map((label, index) => <div key={label} className="flex min-h-11 items-center justify-between gap-3 rounded-lg bg-surface-strong px-3 text-xs"><span className="font-bold">{label}</span><span className={`font-bold ${stage > index ? "text-primary" : phase === "executing" && stage === index ? "text-warning" : "text-muted-foreground"}`}>{stage > index ? "Confirmed" : phase === "executing" && stage === index ? "Submitting" : "Ready"}</span></div>)}</div><div className="mt-4 flex gap-2 rounded-xl bg-warning/10 p-3 text-xs leading-5 text-muted-foreground"><AlertTriangle className="mt-0.5 shrink-0 text-warning" aria-hidden="true" size={16} /><p>Approve each sponsored passkey operation as the route advances across Arc, CCTP and Base. The strategy exposes 20% to WETH and impermanent loss and may take several minutes while CCTP attests the bridge.</p></div>{error ? <p className="mt-4 text-xs font-semibold leading-5 text-destructive" role="alert">{error}</p> : null}{phase !== "executing" ? <><button type="button" onClick={() => void execute()} className="focus-ring mt-5 min-h-12 w-full rounded-[var(--radius-control)] bg-primary px-4 text-sm font-extrabold text-primary-foreground">{phase === "partial" ? "Resume unfinished step" : "Confirm cross-chain investment"}</button><button type="button" onClick={reset} className="focus-ring mt-2 min-h-11 w-full rounded-[var(--radius-control)] px-4 text-sm font-bold text-muted-foreground">Cancel</button></> : <div className="mt-5 flex min-h-12 items-center justify-center gap-2 rounded-[var(--radius-control)] bg-secondary text-sm font-bold"><LoaderCircle className="animate-spin" aria-hidden="true" size={17} /> Submitting reviewed route</div>}</Panel>;
+    return <Panel title={phase === "review" ? "Review cross-chain plan" : phase === "partial" ? "Route paused" : "Executing route"} eyebrow="EXPERIMENTAL"><dl className="divide-y divide-border rounded-xl bg-muted px-4"><Row label="Total investment" value={plan.total} token="USDC" /><Row label="Morpho on Arc" value={plan.morpho} token="USDC" /><Row label="CCTP to Base" value={plan.base} token="USDC" /><Row label="Estimated bridge fee" value={plan.bridge.feeTotal} token="USDC" /><Row label="Estimated Arc reserve" value={plan.retained} token="USDC" /><Row label="Uniswap swap" value={plan.swapUsdc} token="USDC" /><Row label="Minimum WETH" value={plan.swap.minimumOutput} token="WETH" price={plan.swap.minimumOutput === "0" ? undefined : Number(plan.swapUsdc) / Number(plan.swap.minimumOutput)} /></dl><div className="mt-4 space-y-2">{["Deposit to Morpho on Arc", "Bridge USDC with CCTP", "Swap half to WETH on Base", "Mint wide-range Uniswap V3 NFT"].map((label, index) => <div key={label} className="flex min-h-11 items-center justify-between gap-3 rounded-lg bg-surface-strong px-3 text-xs"><span className="font-bold">{label}</span><span className={`font-bold ${stage > index ? "text-primary" : phase === "executing" && stage === index ? "text-warning" : "text-muted-foreground"}`}>{stage > index ? "Confirmed" : phase === "executing" && stage === index ? "Submitting" : "Ready"}</span></div>)}</div><div className="mt-4 flex gap-2 rounded-xl bg-warning/10 p-3 text-xs leading-5 text-muted-foreground"><AlertTriangle className="mt-0.5 shrink-0 text-warning" aria-hidden="true" size={16} /><p>Approve each sponsored passkey operation as the route advances across Arc, CCTP and Base. The strategy exposes 20% to WETH and impermanent loss and may take several minutes while CCTP attests the bridge.</p></div>{error ? <p className="mt-4 text-xs font-semibold leading-5 text-destructive" role="alert">{error}</p> : null}{phase !== "executing" ? <><button type="button" onClick={() => void execute()} disabled={submissionUnknown} className="disabled:opacity-60 focus-ring mt-5 min-h-12 w-full rounded-[var(--radius-control)] bg-primary px-4 text-sm font-extrabold text-primary-foreground">{submissionUnknown ? "Check interrupted submission in wallet history" : phase === "partial" ? "Resume unfinished step" : "Confirm cross-chain investment"}</button>{phase === "review" ? <button type="button" onClick={reset} className="focus-ring mt-2 min-h-11 w-full rounded-[var(--radius-control)] px-4 text-sm font-bold text-muted-foreground">Cancel</button> : null}</> : <div className="mt-5 flex min-h-12 items-center justify-center gap-2 rounded-[var(--radius-control)] bg-secondary text-sm font-bold"><LoaderCircle className="animate-spin" aria-hidden="true" size={17} /> Submitting reviewed route</div>}</Panel>;
   }
 
-  return <form onSubmit={requestPlan} noValidate className="rounded-[var(--radius-card)] border border-border bg-card p-5 md:p-6"><div className="flex items-start gap-3"><span className="grid size-10 shrink-0 place-items-center rounded-full bg-concept/10 text-concept"><Route aria-hidden="true" size={18} /></span><div><h2 className="text-lg font-extrabold tracking-[-0.02em]">Buy cross-chain basket</h2><p className="mt-1 text-xs leading-5 text-muted-foreground">One capped route across Arc, CCTP and Base Uniswap.</p></div></div><div className="mt-5"><label htmlFor="cross-chain-amount" className="text-sm font-bold">You invest</label><div className="mt-2 flex min-h-14 items-center rounded-[var(--radius-control)] border border-input bg-background px-4 focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2"><input ref={inputRef} id="cross-chain-amount" type="text" inputMode="decimal" autoComplete="off" spellCheck={false} value={amount} onChange={(event) => setAmount(event.target.value)} aria-invalid={error ? "true" : undefined} aria-describedby="cross-chain-hint" className="min-w-0 flex-1 bg-transparent font-mono text-xl font-bold tabular-nums outline-none" /><span className="text-sm font-bold text-muted-foreground">USDC</span></div><p id="cross-chain-hint" className={`mt-2 text-xs leading-5 ${error ? "font-semibold text-destructive" : "text-muted-foreground"}`} role={error ? "alert" : undefined}>{error || `Testnet minimum ${MIN_CROSS_CHAIN_USDC} USDC · maximum ${MAX_CROSS_CHAIN_USDC} USDC.`}</p></div>{wallet.status !== "ready" ? <button type="button" onClick={() => void ensureArc()} disabled={wallet.actionPending || wallet.status === "loading" || wallet.status === "unconfigured"} aria-busy={wallet.actionPending} className="focus-ring mt-5 inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-[var(--radius-control)] bg-primary px-4 text-sm font-extrabold text-primary-foreground disabled:opacity-60"><Wallet aria-hidden="true" size={17} />{walletLabel}</button> : <button type="submit" disabled={phase === "quoting"} aria-busy={phase === "quoting"} className="focus-ring mt-5 inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-[var(--radius-control)] bg-primary px-4 text-sm font-extrabold text-primary-foreground disabled:opacity-60">{phase === "quoting" ? <><LoaderCircle className="animate-spin" aria-hidden="true" size={17} />Building live route…</> : "Review live route"}</button>}<div className="mt-4 flex gap-2 text-xs leading-5 text-muted-foreground"><ShieldCheck className="mt-0.5 shrink-0 text-primary" aria-hidden="true" size={15} /><p>Canonical USDC only. Exact approvals and a 1% minimum-output boundary protect the Uniswap transactions.</p></div></form>;
+  return <form onSubmit={requestPlan} noValidate className="rounded-[var(--radius-card)] border border-border bg-card p-5 md:p-6"><div className="flex items-start gap-3"><span className="grid size-10 shrink-0 place-items-center rounded-full bg-concept/10 text-concept"><Route aria-hidden="true" size={18} /></span><div><h2 className="text-lg font-extrabold tracking-[-0.02em]">Buy cross-chain basket</h2><p className="mt-1 text-xs leading-5 text-muted-foreground">One capped route across Arc, CCTP and Base Uniswap.</p></div></div><div className="mt-5"><label htmlFor="cross-chain-amount" className="text-sm font-bold">You invest</label><div className="mt-2 flex min-h-14 items-center rounded-[var(--radius-control)] border border-input bg-background px-4 focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2"><input ref={inputRef} id="cross-chain-amount" type="text" inputMode="decimal" autoComplete="off" spellCheck={false} value={amount} onChange={(event) => setAmount(event.target.value)} aria-invalid={error ? "true" : undefined} aria-describedby="cross-chain-hint" className="min-w-0 flex-1 bg-transparent font-mono text-xl font-bold tabular-nums outline-none" /><span className="text-sm font-bold text-muted-foreground">USDC</span></div><p id="cross-chain-hint" className={`mt-2 text-xs leading-5 ${error ? "font-semibold text-destructive" : "text-muted-foreground"}`} role={error ? "alert" : undefined}>{error || `Testnet minimum ${MIN_CROSS_CHAIN_USDC} USDC · maximum ${MAX_CROSS_CHAIN_USDC} USDC.`}</p></div>{wallet.status !== "ready" ? <button type="button" onClick={() => void ensureArc()} disabled={wallet.actionPending || wallet.status === "loading" || wallet.status === "unconfigured"} aria-busy={wallet.actionPending} className="focus-ring mt-5 inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-[var(--radius-control)] bg-primary px-4 text-sm font-extrabold text-primary-foreground disabled:opacity-60"><Wallet aria-hidden="true" size={17} />{walletLabel}</button> : <button type="submit" disabled={phase === "quoting" || recoveryUnavailable} aria-busy={phase === "quoting"} className="focus-ring mt-5 inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-[var(--radius-control)] bg-primary px-4 text-sm font-extrabold text-primary-foreground disabled:opacity-60">{phase === "quoting" ? <><LoaderCircle className="animate-spin" aria-hidden="true" size={17} />Building live route…</> : "Review live route"}</button>}<div className="mt-4 flex gap-2 text-xs leading-5 text-muted-foreground"><ShieldCheck className="mt-0.5 shrink-0 text-primary" aria-hidden="true" size={15} /><p>Canonical USDC only. Exact approvals and a 1% minimum-output boundary protect the Uniswap transactions.</p></div></form>;
 }
 
 function Panel({ title, eyebrow, children }: { title: string; eyebrow: string; children: React.ReactNode }) {

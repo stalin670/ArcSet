@@ -12,6 +12,7 @@ import { ARC_EXPLORER_URL, ARC_TESTNET } from "@/lib/arc";
 import { allocateBasketAmount, parseBasketUsdcAmount } from "@/lib/basket-amount";
 import type { Basket, BasketLeg } from "@/lib/baskets";
 import { positionsForWallet, readStoredPositions, recordBasketPosition, type AssetExecutionToken, type StoredAssetExecutionLeg } from "@/lib/positions";
+import { createArcExecutionState, executeArcBasketSteps } from "@/lib/arc-basket-execution";
 
 type Phase = "entry" | "quoting" | "review" | "executing" | "success" | "partial";
 type SwapStep = { kind: "swap"; leg: BasketLeg; quote: ArcSwapQuote };
@@ -80,10 +81,12 @@ export function CompositeInvestmentPanel({ basket }: { basket: Basket }) {
   const [completed, setCompleted] = useState<CompletedStep[]>([]);
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
   const [error, setError] = useState("");
+  const [needsRecording, setNeedsRecording] = useState(false);
   const [dismissedRecoveryId, setDismissedRecoveryId] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const executionLock = useRef(false);
   const executionId = useRef<string | null>(null);
+  const executionState = useRef(createArcExecutionState<CompletedStep>());
 
   const allocations = useMemo(
     () => microUsdc == null ? [] : allocateBasketAmount(basket.legs, microUsdc),
@@ -115,6 +118,7 @@ export function CompositeInvestmentPanel({ basket }: { basket: Basket }) {
   }
 
   function reset() {
+    setNeedsRecording(false);
     setPhase("entry");
     setMicroUsdc(null);
     setSteps([]);
@@ -123,6 +127,7 @@ export function CompositeInvestmentPanel({ basket }: { basket: Basket }) {
     setError("");
     executionLock.current = false;
     executionId.current = null;
+    executionState.current = createArcExecutionState<CompletedStep>();
     requestAnimationFrame(() => inputRef.current?.focus());
   }
 
@@ -154,6 +159,7 @@ export function CompositeInvestmentPanel({ basket }: { basket: Basket }) {
       setMicroUsdc(parsed);
       setSteps(quoted);
       setCompleted(restored);
+      executionState.current = createArcExecutionState(restored.map((value) => ({ id: value.record.outputToken, status: value.record.status === "complete" ? "complete" : "pending", value })));
       executionId.current = recovery.id;
       setPhase("partial");
     } catch (recoveryError) {
@@ -217,74 +223,89 @@ export function CompositeInvestmentPanel({ basket }: { basket: Basket }) {
 
   async function executeBasket() {
     if (!steps.length || executionLock.current) return;
-    if (!steps.some((step) => !completedStepFor(step, completed))) return;
+    if (!executionState.current.needsRecording && !steps.some((step) => !completedStepFor(step, completed))) return;
 
     executionLock.current = true;
     executionId.current = executionId.current ?? `${basket.slug}:${Date.now()}`;
     setError("");
     setPhase("executing");
-    const confirmed = [...completed];
     try {
       const provider = await getProvider();
-      for (let index = 0; index < steps.length; index += 1) {
-        if (completedStepFor(steps[index], confirmed)) continue;
-        setActiveIndex(index);
-        const previousStep = steps[index];
-        // Refresh immediately before every signature. Later steps can no longer
-        // expire while the user approves an earlier allocation.
-        const step: QuotedStep = previousStep.kind === "earn"
-          ? { ...previousStep, quote: await quoteArcEarnDeposit(provider, previousStep.quote.amountIn) }
-          : { ...previousStep, quote: await quoteUsdcToToken(provider, outputTokenForLeg(previousStep.leg), previousStep.quote.amountIn) };
-        setSteps((current) => current.map((item, itemIndex) => itemIndex === index ? step : item));
-        let completedStep: CompletedStep;
-        if (step.kind === "swap") {
-          const execution = await executeUsdcToToken(provider, step.quote);
-          if (execution.outputToken === "USDC") throw new Error("The basket swap returned an unexpected USDC output.");
-          completedStep = {
-            leg: step.leg,
-            explorerUrl: execution.explorerUrl,
-            record: {
-              name: step.leg.name,
-              outputToken: execution.outputToken,
-              amountInUsdc: execution.amountIn,
-              outputAmount: execution.amountOut ?? step.quote.estimatedOutput,
-              outputAmountSource: execution.amountOut ? "actual" : "estimated",
-              transactionHash: execution.txHash as `0x${string}`,
-              status: execution.status === "DONE" ? "complete" : "pending",
-            },
-          };
-        } else {
-          const execution = await executeArcEarnQuote(provider, step.quote);
-          completedStep = {
-            leg: step.leg,
-            explorerUrl: execution.explorerUrl,
-            record: {
-              name: step.leg.name,
-              outputToken: "EARN-USDC",
-              amountInUsdc: step.quote.amountIn,
-              outputAmount: execution.amount,
-              outputAmountSource: "actual",
-              transactionHash: execution.txHash,
-              status: "complete",
-            },
-          };
-        }
-        confirmed.push(completedStep);
-        setCompleted([...confirmed]);
-        persistProgress(confirmed, steps.every((currentStep) => Boolean(completedStepFor(currentStep, confirmed))));
-        if (completedStep.record.status === "pending") throw new Error("The submitted Arc transaction is still pending.");
-      }
+      const result = await executeArcBasketSteps({
+        state: executionState.current,
+        steps,
+        id: (step) => recordTokenForLeg(step.leg),
+        quote: async (previousStep) => {
+          const index = steps.indexOf(previousStep);
+          setActiveIndex(index);
+          // Refresh immediately before every signature. Later steps can no longer
+          // expire while the user approves an earlier allocation.
+          const step: QuotedStep = previousStep.kind === "earn"
+            ? { ...previousStep, quote: await quoteArcEarnDeposit(provider, previousStep.quote.amountIn) }
+            : { ...previousStep, quote: await quoteUsdcToToken(provider, outputTokenForLeg(previousStep.leg), previousStep.quote.amountIn) };
+          setSteps((current) => current.map((item, itemIndex) => itemIndex === index ? step : item));
+          return step;
+        },
+        execute: async (_previousStep, step) => {
+          let completedStep: CompletedStep;
+          if (step.kind === "swap") {
+            const execution = await executeUsdcToToken(provider, step.quote);
+            if (execution.outputToken === "USDC") throw new Error("The basket swap returned an unexpected USDC output.");
+            completedStep = {
+              leg: step.leg,
+              explorerUrl: execution.explorerUrl,
+              record: {
+                name: step.leg.name,
+                outputToken: execution.outputToken,
+                amountInUsdc: execution.amountIn,
+                outputAmount: execution.amountOut ?? step.quote.estimatedOutput,
+                outputAmountSource: execution.amountOut ? "actual" : "estimated",
+                transactionHash: execution.txHash as `0x${string}`,
+                status: execution.status === "DONE" ? "complete" : "pending",
+              },
+            };
+          } else {
+            const execution = await executeArcEarnQuote(provider, step.quote);
+            completedStep = {
+              leg: step.leg,
+              explorerUrl: execution.explorerUrl,
+              record: {
+                name: step.leg.name,
+                outputToken: "EARN-USDC",
+                amountInUsdc: step.quote.amountIn,
+                outputAmount: execution.amount,
+                outputAmountSource: "actual",
+                transactionHash: execution.txHash,
+                status: "complete",
+              },
+            };
+          }
+          return { status: completedStep.record.status === "complete" ? "complete" as const : "pending" as const, value: completedStep };
+        },
+        record: (outcomes, complete) => {
+          const confirmed = outcomes.map((outcome) => outcome.value);
+          setCompleted(confirmed);
+          persistProgress(confirmed, complete);
+        },
+      });
       setActiveIndex(null);
+      if (result.status !== "complete") {
+        setCompleted(executionState.current.outcomes.map((outcome) => outcome.value));
+        setError(result.status === "recording-failed" ? "The transaction was submitted, but its local record could not be saved. Keep this page open and inspect the receipt before continuing." : "The submitted Arc transaction is still pending. Check Portfolio before continuing.");
+        setPhase("partial");
+        return;
+      }
       setPhase("success");
       if (recovery) setDismissedRecoveryId(recovery.id);
-      await wallet.refreshBalance();
+      await wallet.refreshBalance().catch(() => setError("Investment completed. Balance refresh is temporarily unavailable."));
     } catch (executeError) {
       setActiveIndex(null);
+      const confirmed = executionState.current.outcomes.map((outcome) => outcome.value);
       setCompleted([...confirmed]);
-      persistProgress(confirmed, false);
       setError(userFacingCompositeError(executeError, confirmed.length));
       setPhase(confirmed.length ? "partial" : "review");
     } finally {
+      setNeedsRecording(Boolean(executionState.current.needsRecording));
       executionLock.current = false;
     }
   }
@@ -305,7 +326,7 @@ export function CompositeInvestmentPanel({ basket }: { basket: Basket }) {
         </div>
         {error ? <p className="mt-4 text-xs font-semibold leading-5 text-destructive" role="alert">{error}</p> : null}
         <div className="mt-5 grid gap-2">
-          {phase === "partial" && remainingCount > 0 && !hasPending ? <button type="button" onClick={() => void executeBasket()} className="focus-ring min-h-11 rounded-[var(--radius-control)] bg-primary px-4 text-sm font-extrabold text-primary-foreground">Retry remaining steps</button> : null}
+          {phase === "partial" && (needsRecording || (remainingCount > 0 && !hasPending)) ? <button type="button" onClick={() => void executeBasket()} className="focus-ring min-h-11 rounded-[var(--radius-control)] bg-primary px-4 text-sm font-extrabold text-primary-foreground">{needsRecording ? "Retry saving receipts" : "Retry remaining steps"}</button> : null}
           <Link href="/positions" className="focus-ring inline-flex min-h-11 items-center justify-center rounded-[var(--radius-control)] bg-secondary px-4 text-sm font-bold text-secondary-foreground">View portfolio</Link>
           {phase === "success" ? <button type="button" onClick={reset} className="focus-ring min-h-11 rounded-[var(--radius-control)] px-4 text-sm font-bold text-muted-foreground">Invest again</button> : null}
         </div>

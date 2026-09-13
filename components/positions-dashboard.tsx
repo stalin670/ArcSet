@@ -15,13 +15,12 @@ import { getBasket } from "@/lib/baskets";
 import type { ArcAssetPrices } from "@/lib/asset-prices-server";
 import {
   aggregateBasketPositions,
-  clearStoredPositions,
   POSITION_UPDATED_EVENT,
   positionsForWallet,
   readStoredPositions,
-  reconcileStoredPositions,
-  replaceStoredPositions,
+  reconcilePositionReceipts,
   type StoredBasketPosition,
+  type AggregatedBasketPosition,
   type TransactionResolution,
 } from "@/lib/positions";
 import {
@@ -31,6 +30,7 @@ import {
   removeCrossChainPosition,
   type CrossChainBasketPosition,
 } from "@/lib/cross-chain-positions";
+import { subscribePositionChanges } from "@/lib/position-store";
 
 type WalletAsset = { symbol: "USDC" | "EURC" | "cirBTC"; balance: string; rawBalance: string; decimals: 6 | 8 };
 type WalletAssetsResponse = { address: string; chainId: number; asOf: number; assets: WalletAsset[] };
@@ -48,31 +48,28 @@ export function PositionsDashboard() {
   const wallet = useArcWallet();
   const [storedPositions, setStoredPositions] = useState<StoredBasketPosition[]>([]);
   const [crossChainPositions, setCrossChainPositions] = useState<CrossChainBasketPosition[]>([]);
+  const [activeExits, setActiveExits] = useState<Record<string, AggregatedBasketPosition>>({});
   const [storageLoading, setStorageLoading] = useState(true);
   const [storageError, setStorageError] = useState("");
 
   useEffect(() => {
     function refreshStoredPositions() {
+      const errors: string[] = [];
       try {
         setStoredPositions(readStoredPositions());
-        setCrossChainPositions(wallet.address ? crossChainPositionsForWallet(readCrossChainPositions(), wallet.address) : []);
-        setStorageError("");
       } catch {
-        setStoredPositions([]);
-        setStorageError("Saved position metadata could not be read.");
-      } finally {
-        setStorageLoading(false);
+        errors.push("Arc position metadata could not be read.");
       }
+      try {
+        setCrossChainPositions(wallet.address ? crossChainPositionsForWallet(readCrossChainPositions(), wallet.address) : []);
+      } catch {
+        errors.push("Cross-chain position metadata could not be read.");
+      }
+      setStorageError(errors.join(" "));
+      setStorageLoading(false);
     }
     refreshStoredPositions();
-    window.addEventListener("storage", refreshStoredPositions);
-    window.addEventListener(POSITION_UPDATED_EVENT, refreshStoredPositions);
-    window.addEventListener(CROSS_CHAIN_POSITION_UPDATED_EVENT, refreshStoredPositions);
-    return () => {
-      window.removeEventListener("storage", refreshStoredPositions);
-      window.removeEventListener(POSITION_UPDATED_EVENT, refreshStoredPositions);
-      window.removeEventListener(CROSS_CHAIN_POSITION_UPDATED_EVENT, refreshStoredPositions);
-    };
+    return subscribePositionChanges([POSITION_UPDATED_EVENT, CROSS_CHAIN_POSITION_UPDATED_EVENT], refreshStoredPositions);
   }, [wallet.address]);
 
   const holdings = useQuery({
@@ -119,6 +116,14 @@ export function PositionsDashboard() {
     if (!wallet.address) return [];
     return aggregateBasketPositions(positionsForWallet(storedPositions, wallet.address));
   }, [storedPositions, wallet.address]);
+  // Keep the receipt panel mounted after a full exit removes the holding.
+  const displayedPositions = [...recorded];
+  for (const [key, snapshot] of Object.entries(activeExits)) {
+    if (key === `${wallet.address}:${snapshot.basketSlug}` && !recorded.some((position) => position.basketSlug === snapshot.basketSlug)) {
+      displayedPositions.push({ ...snapshot, investedUsdc: "0", retainedUsdc: "0", outputs: [] });
+    }
+  }
+  const visibleCrossChainPositions = wallet.address ? crossChainPositionsForWallet(crossChainPositions, wallet.address) : [];
   const pendingHashes = useMemo(() => storedPositions
     .filter((position) => !wallet.address || position.walletAddress.toLowerCase() === wallet.address.toLowerCase())
     .flatMap((position) => position.legs.filter((leg) => leg.status === "pending").map((leg) => leg.transactionHash.toLowerCase())), [storedPositions, wallet.address]);
@@ -139,10 +144,17 @@ export function PositionsDashboard() {
   });
 
   useEffect(() => {
-    if (!reconciliation.data || !Object.keys(reconciliation.data).length) return;
-    const next = reconcileStoredPositions(storedPositions, reconciliation.data);
-    if (JSON.stringify(next) !== JSON.stringify(storedPositions)) replaceStoredPositions(next);
-  }, [reconciliation.data, storedPositions]);
+    function reconcile() {
+      if (!reconciliation.data || !Object.keys(reconciliation.data).length) return;
+      try {
+        reconcilePositionReceipts(reconciliation.data);
+      } catch (error) {
+        setStorageError(error instanceof Error ? error.message : "Receipt updates could not be saved.");
+      }
+    }
+    reconcile();
+    return subscribePositionChanges([POSITION_UPDATED_EVENT], reconcile);
+  }, [reconciliation.data]);
   const usdcBalance = assetBalance(holdings.data, "USDC");
   const eurcBalance = assetBalance(holdings.data, "EURC");
   const cirbtcBalance = assetBalance(holdings.data, "cirBTC");
@@ -189,10 +201,10 @@ export function PositionsDashboard() {
       {storageError ? (
         <StateMessage
           icon={AlertCircle}
-          title="Saved position metadata is damaged"
-          description="Clear the invalid browser record. Your on-chain assets are unaffected."
-          actionLabel="Clear invalid record"
-          onAction={() => { clearStoredPositions(); setStorageError(""); }}
+          title="Saved position metadata needs attention"
+          description={storageError}
+          actionLabel="Retry reading records"
+          onAction={() => window.dispatchEvent(new Event(POSITION_UPDATED_EVENT))}
           destructive
         />
       ) : null}
@@ -217,19 +229,21 @@ export function PositionsDashboard() {
       <section aria-labelledby="basket-positions-title" className="overflow-hidden rounded-[var(--radius-card)] border border-border bg-card">
         <div className="flex items-center justify-between border-b border-border p-5 md:px-6">
           <h2 id="basket-positions-title" className="text-xl font-extrabold tracking-[-0.025em]">Baskets</h2>
-          <span className="rounded-full bg-muted px-3 py-2 font-mono text-xs font-bold">{recorded.length + crossChainPositions.length + (hasEarnPosition && recordedEarnPrincipal === 0 ? 1 : 0)} positions</span>
+          <span className="rounded-full bg-muted px-3 py-2 font-mono text-xs font-bold">{recorded.length + visibleCrossChainPositions.length + (hasEarnPosition && recordedEarnPrincipal === 0 ? 1 : 0)} positions</span>
         </div>
 
-        {recorded.length || hasEarnPosition || crossChainPositions.length ? (
+        {displayedPositions.length || hasEarnPosition || visibleCrossChainPositions.length ? (
           <div className="divide-y divide-border">
             {hasEarnPosition && recordedEarnPrincipal === 0 && earnPosition.data ? <EarnPositionCard position={earnPosition.data} /> : null}
-            {crossChainPositions.map((position) => <CrossChainPositionCard key={position.id} position={position} onRemove={() => removeCrossChainPosition(position.id)} />)}
-            {recorded.map((position) => {
+            {visibleCrossChainPositions.map((position) => <CrossChainPositionCard key={position.id} position={position} onRemove={() => {
+              try { removeCrossChainPosition(position.id); } catch (error) { setStorageError(error instanceof Error ? error.message : "Could not remove saved position."); }
+            }} />)}
+            {displayedPositions.map((position) => {
               const basket = getBasket(position.basketSlug);
               if (!basket) return null;
               const drift = prices.data ? calculateBasketDrift(basket, position, { USDC: prices.data.USDC, EURC: prices.data.EURC, cirBTC: prices.data.cirBTC, "EARN-USDC": earnValueMultiplier }) : null;
               return (
-                <article key={position.basketSlug} className="p-5 md:px-6">
+                <article key={`${wallet.address}:${position.basketSlug}`} className="p-5 md:px-6">
                   <div className="flex flex-wrap items-start justify-between gap-4">
                     <div><div className="flex flex-wrap items-center gap-2"><h3 className="text-lg font-extrabold">{basket.name}</h3><StatusBadge status={position.status} /></div><p className="mt-1 text-xs text-muted-foreground">Updated {positionDate(position.latestCreatedAt)}</p></div>
                     <div className="text-right"><span className="block text-xs font-bold text-muted-foreground">Current value</span><FormattedNumber value={drift?.currentValue ?? Number(position.investedUsdc)} type="stable_value" context="detailed" className="mt-1 block text-xl font-extrabold" /></div>
@@ -241,7 +255,15 @@ export function PositionsDashboard() {
                   <BasketDriftReview drift={drift} loading={prices.isLoading} />
                   <div className="mt-4 flex flex-wrap items-center gap-2">
                     <Link href={`/basket/${basket.slug}`} className="focus-ring inline-flex min-h-10 items-center rounded-[var(--radius-control)] bg-primary px-4 text-sm font-extrabold text-primary-foreground">Manage</Link>
-                    {position.status !== "pending" && position.outputs.length ? <BasketExitPanel basket={basket} position={position} earnValueMultiplier={earnValueMultiplier} /> : <span className="inline-flex min-h-11 items-center px-3 text-xs font-bold text-warning">{position.status === "pending" ? "Checking pending steps before exit" : "No completed assets to exit"}</span>}
+                    <BasketExitPanel basket={basket} position={position} earnValueMultiplier={earnValueMultiplier} onActiveChange={(active) => {
+                      const key = `${wallet.address}:${position.basketSlug}`;
+                      setActiveExits((current) => {
+                        const next = { ...current };
+                        if (active) next[key] = position;
+                        else delete next[key];
+                        return next;
+                      });
+                    }} />
                     <a href={`${ARC_EXPLORER_URL}/tx/${position.latestTransactionHash}`} target="_blank" rel="noreferrer" aria-label={`View latest ${basket.name} transaction`} className="focus-ring grid size-10 place-items-center rounded-lg text-muted-foreground hover:text-foreground"><ArrowUpRight aria-hidden="true" size={16} /></a>
                   </div>
                 </article>
